@@ -16,6 +16,15 @@ PLOT_PHASE_ERROR_FOR_ALL_SOURCES = False
 PLOT_PHASE_VS_WAVELENGTH = True
 
 
+DESIRED_SOURCE_PHASES = {
+    'i1': 180,
+    'i2': 90,
+    'i3': 0,
+    'i4': -90,
+    'i5': -180,
+}
+
+
 # Path to the simulation results (last block after the final "Source:" marker is used)
 DATA_PATH = Path(r"C:\\Users\\Éloi Blouin\\Desktop\\git\\Star_coupler_simulation\\output\\simulations\\star_coupler_S_matrix_V9.txt")
 
@@ -335,6 +344,195 @@ def _display_monitor_name(name: str) -> str:
     return name
 
 
+def _normalize_phase_deg(phase_deg: float) -> float:
+    """Normalize a phase angle to the [-180, 180] range."""
+    while phase_deg > 180:
+        phase_deg -= 360
+    while phase_deg < -180:
+        phase_deg += 360
+    return phase_deg
+
+
+def _extract_output_number(name: str):
+    """Extract an output index from a monitor name like freq_monitor_out3."""
+    display_name = _display_monitor_name(name)
+    if not isinstance(display_name, str) or not display_name.startswith("out"):
+        return None
+    try:
+        return int(display_name.replace("out", ""))
+    except ValueError:
+        return None
+
+
+def _get_output_monitors_in_order(data):
+    """Return output monitors sorted by their output number."""
+    monitors = []
+    for monitor in data.keys():
+        output_number = _extract_output_number(monitor)
+        if output_number is not None:
+            monitors.append((output_number, monitor))
+    return [monitor for _, monitor in sorted(monitors)]
+
+
+def _wrap_relative_to_reference(phase_deg: float) -> float:
+    """Normalize a relative phase so it is comparable across wraps."""
+    return _normalize_phase_deg(phase_deg)
+
+
+def _desired_relative_phase(source_name: str, output_index: int) -> float:
+    """Return the desired relative phase for an output index in the paper convention.
+
+    output_index is 1-based, so out1 is the reference at 0°.
+    The desired phase is cumulative from out1: (output_index - 1) * step.
+    """
+    step_deg = DESIRED_SOURCE_PHASES.get(source_name, 0)
+    return _normalize_phase_deg((output_index - 1) * step_deg)
+
+
+def _desired_relative_phase_raw(source_name: str, output_index: int) -> float:
+    """Return the unwrapped cumulative desired phase for an output index."""
+    step_deg = DESIRED_SOURCE_PHASES.get(source_name, 0)
+    return (output_index - 1) * step_deg
+
+
+def print_phase_error_summary(data, source_name, desired_phase_shift=None):
+    """Print per-output phase differences and the RMS error for one input source.
+
+    The reference is out1. The desired phase for outN is cumulative from out1:
+    (N - 1) * source step, matching the phase progression described in the paper.
+    """
+    if not data:
+        print(f"Source {source_name}: no data available.")
+        return
+
+    output_monitors = _get_output_monitors_in_order(data)
+    if not output_monitors:
+        print(f"Source {source_name}: no output monitors found.")
+        return
+
+    ref_name = output_monitors[0]
+    if ref_name not in data:
+        print(f"Source {source_name}: reference output not found.")
+        return
+
+    ref_wavelengths = data[ref_name].get("wavelength", [])
+    ref_phases = data[ref_name].get("phase_deg", [])
+    if not ref_wavelengths or not ref_phases:
+        print(f"Source {source_name}: reference phase data unavailable.")
+        return
+
+    ref_map = dict(zip(ref_wavelengths, ref_phases))
+    all_errors = []
+
+    step_deg = DESIRED_SOURCE_PHASES.get(source_name, 0) if desired_phase_shift is None else desired_phase_shift
+    print(f"\nInput {source_name} | phase step = {step_deg:.1f}° | reference = {_display_monitor_name(ref_name)}")
+
+    for monitor in output_monitors:
+        output_number = _extract_output_number(monitor)
+        if output_number is None:
+            continue
+
+        phase_map = dict(zip(data[monitor].get("wavelength", []), data[monitor].get("phase_deg", [])))
+        common_wavelengths = sorted(set(ref_map) & set(phase_map))
+        if not common_wavelengths:
+            continue
+
+        phase_differences = []
+        target_phase_deg_raw = _desired_relative_phase_raw(source_name, output_number)
+        target_phase_deg = _normalize_phase_deg(target_phase_deg_raw)
+        for wl in common_wavelengths:
+            actual_relative_deg = _wrap_relative_to_reference(phase_map[wl] - ref_map[wl])
+            error_deg = _normalize_phase_deg(actual_relative_deg - target_phase_deg)
+            phase_differences.append((actual_relative_deg, error_deg))
+            all_errors.append(error_deg)
+
+        if not phase_differences:
+            continue
+
+        error_values = np.asarray([error for _, error in phase_differences], dtype=float)
+        monitor_rms = float(np.sqrt(np.mean(np.square(error_values))))
+        first_actual_relative, first_error = phase_differences[0]
+
+        print(
+            f"  {_display_monitor_name(monitor)}: target={target_phase_deg_raw:.2f}° "
+            f"(wrapped {target_phase_deg:.2f}°) | "
+            f"actual={first_actual_relative:.2f}° | error={first_error:.2f}° | RMS={monitor_rms:.2f}°"
+        )
+
+    if not all_errors:
+        print(f"  No common wavelengths found for Input {source_name}.")
+        return
+
+    all_errors_arr = np.asarray(all_errors, dtype=float)
+    rms_error = float(np.sqrt(np.mean(np.square(all_errors_arr))))
+    mean_abs_error = float(np.mean(np.abs(all_errors_arr)))
+    max_abs_error = float(np.max(np.abs(all_errors_arr)))
+
+    print(
+        f"  Summary: RMS phase error = {rms_error:.2f}° | "
+        f"mean |error| = {mean_abs_error:.2f}° | max |error| = {max_abs_error:.2f}°"
+    )
+
+
+def compute_phase_error_values(data, source_name, desired_phase_shift=None):
+    """Return all phase error values for one source using the out1-referenced convention."""
+    output_monitors = _get_output_monitors_in_order(data)
+    if not output_monitors:
+        return []
+
+    ref_name = output_monitors[0]
+    if ref_name not in data:
+        return []
+
+    ref_wavelengths = data[ref_name].get("wavelength", [])
+    ref_phases = data[ref_name].get("phase_deg", [])
+    if not ref_wavelengths or not ref_phases:
+        return []
+
+    ref_map = dict(zip(ref_wavelengths, ref_phases))
+    step_deg = DESIRED_SOURCE_PHASES.get(source_name, 0) if desired_phase_shift is None else desired_phase_shift
+
+    error_values = []
+    for monitor in output_monitors:
+        output_number = _extract_output_number(monitor)
+        if output_number is None:
+            continue
+
+        phase_map = dict(zip(data[monitor].get("wavelength", []), data[monitor].get("phase_deg", [])))
+        common_wavelengths = sorted(set(ref_map) & set(phase_map))
+        if not common_wavelengths:
+            continue
+
+        target_phase_deg = _desired_relative_phase(source_name, output_number)
+        for wl in common_wavelengths:
+            actual_relative_deg = _wrap_relative_to_reference(phase_map[wl] - ref_map[wl])
+            error_values.append(_normalize_phase_deg(actual_relative_deg - target_phase_deg))
+
+    return error_values
+
+
+def print_global_phase_error_summary(sources_data):
+    """Print a combined RMS error across all input sources."""
+    combined_errors = []
+
+    for source_name, data in sorted(sources_data.items()):
+        combined_errors.extend(compute_phase_error_values(data, source_name))
+
+    if not combined_errors:
+        print("\nGlobal RMS phase error: no data available.")
+        return
+
+    errors = np.asarray(combined_errors, dtype=float)
+    rms_error = float(np.sqrt(np.mean(np.square(errors))))
+    mean_abs_error = float(np.mean(np.abs(errors)))
+    max_abs_error = float(np.max(np.abs(errors)))
+
+    print(
+        f"\nGlobal RMS phase error across all inputs = {rms_error:.2f}° | "
+        f"mean |error| = {mean_abs_error:.2f}° | max |error| = {max_abs_error:.2f}°"
+    )
+
+
 def plot_polar_phase_for_source(data, source_name):
     """Plot phase of each output port in polar coordinates (phasor diagram) for a single source."""
     monitors = sorted(data.keys())
@@ -506,13 +704,6 @@ def plot_phase_shift_all_sources(sources_data, max_sources=5, plot_all_wavelengt
         wavelengths = [wavelengths[0]]
 
     colors = ['red', 'blue', 'green', 'orange', 'purple']
-    desired_source_phases = {
-        'i1': 180,
-        'i2': 90,
-        'i3': 0,
-        'i4': 90,
-        'i5': 180,
-    }
 
     for wl in wavelengths:
         fig, axes = plt.subplots(1, num_sources, figsize=(5 * num_sources, 5),
@@ -558,7 +749,7 @@ def plot_phase_shift_all_sources(sources_data, max_sources=5, plot_all_wavelengt
                          fc=color, ec=color, linewidth=2.5, label=_display_monitor_name(monitor))
 
             ax.set_ylim(0, 0.15)
-            desired_phase = desired_source_phases.get(source_name, 0)
+            desired_phase = DESIRED_SOURCE_PHASES.get(source_name, 0)
             ax.set_title(f"Source {source_name}\n(Desired: {desired_phase}°)", fontsize=10, fontweight='bold')
             ax.grid(True)
 
@@ -578,24 +769,10 @@ def plot_phase_shift_all_sources(sources_data, max_sources=5, plot_all_wavelengt
 def plot_phase_error_all_sources(sources_data, max_sources=5):
     """Plot phase error (desired vs simulated) for all sources in subplots.
     
-    Each input source has a desired phase shift relative to i1:
-    - i3: 0° (centre)
-    - i2: 90°
-    - i4: 90°
-    - i1: 180°
-    - i5: 180°
-    
-    Error = simulated phase shift - desired phase shift
+    Each input source has a phase step relative to out1.
+    The desired phase for outN is cumulative: (N - 1) * step.
+    Error = simulated relative phase - desired relative phase
     """
-    # Desired phase shifts for 5 inputs (centre i3 = 0°, i2/i4 = 90°, i1/i5 = 180°)
-    desired_source_phases = {
-        'i1': 180,
-        'i2': 90,
-        'i3': 0,
-        'i4': 90,
-        'i5': 180,
-    }
-    
     num_sources = min(len(sources_data), max_sources)
     fig, axes = plt.subplots(1, num_sources, figsize=(5 * num_sources, 5), 
                              subplot_kw=dict(projection='polar'))
@@ -608,10 +785,13 @@ def plot_phase_error_all_sources(sources_data, max_sources=5):
     
     for idx, (source_name, data) in enumerate(sorted(sources_data.items())[:max_sources]):
         ax = axes[idx]
-        monitors = sorted(data.keys())
+        monitors = _get_output_monitors_in_order(data)
+        if not monitors:
+            print(f"No output monitors found in source {source_name}")
+            continue
         
-        # Get reference phase from i1
-        ref_monitor = _get_reference_monitor_name(data)
+        # Get reference phase from out1
+        ref_monitor = monitors[0]
         if ref_monitor not in data:
             print(f"Reference monitor not found in source {source_name}")
             continue
@@ -622,25 +802,21 @@ def plot_phase_error_all_sources(sources_data, max_sources=5):
             print(f"Reference phase unavailable for source {source_name}")
             continue
         
-        # Extract input number from source name (e.g., "i1", "i2")
-        desired_phase_shift = desired_source_phases.get(source_name, 0)
+        step_deg = DESIRED_SOURCE_PHASES.get(source_name, 0)
         
         # Plot each monitor as a phasor with error calculation
         for monitor, color in zip(monitors, colors):
             try:
                 magnitude = data[monitor]["transmission"][0]
-                phase_sim_deg = data[monitor]["phase_deg"][0] - ref_phase_deg
+                output_number = _extract_output_number(monitor)
+                if output_number is None:
+                    continue
+                phase_sim_deg = _wrap_relative_to_reference(data[monitor]["phase_deg"][0] - ref_phase_deg)
             except (KeyError, IndexError):
                 continue
             
-            # Error = simulated - desired
-            phase_error_deg = phase_sim_deg - desired_phase_shift
-            
-            # Normalize error to [-180, 180]
-            while phase_error_deg > 180:
-                phase_error_deg -= 360
-            while phase_error_deg < -180:
-                phase_error_deg += 360
+            desired_phase_deg = _desired_relative_phase(source_name, output_number)
+            phase_error_deg = _normalize_phase_deg(phase_sim_deg - desired_phase_deg)
             
             phase_rad = np.radians(phase_error_deg)
             ax.arrow(phase_rad, 0, 0, magnitude, head_width=0.1, head_length=0.01,
@@ -649,7 +825,7 @@ def plot_phase_error_all_sources(sources_data, max_sources=5):
                     ha='center', va='bottom', fontsize=8, fontweight='bold')
         
         ax.set_ylim(0, 0.15)
-        ax.set_title(f"Source {source_name}\n(Desired: {desired_phase_shift}°)", fontsize=10, fontweight='bold')
+        ax.set_title(f"Source {source_name}\n(Step: {step_deg}° from out1)", fontsize=10, fontweight='bold')
         ax.grid(True)
     
     # Remove legend duplication by using the last subplot
@@ -687,6 +863,8 @@ def main():
         if not PLOT_ALL_WAVELENGTHS:
             wl = plot_data[list(plot_data.keys())[0]]["wavelength"][0]
             print(f"  Wavelength: {wl:.5f} μm")
+
+        print_phase_error_summary(plot_data, source_name)
         
         # Create plots for this source based on flags
         if PLOT_PHASE:
@@ -705,12 +883,15 @@ def main():
     # Plot all sources phase errors in one figure with subplots
     if PLOT_PHASE_ERROR_FOR_ALL_SOURCES:
         plot_phase_error_all_sources(filtered_sources_data)
+
+    print_global_phase_error_summary(filtered_sources_data)
     
     # Plot phase vs wavelength for all sources
     if PLOT_PHASE_VS_WAVELENGTH:
         plot_phase_vs_wavelength_all_sources(sources_data)
     
-    plt.show()
+    if "agg" not in plt.get_backend().lower():
+        plt.show()
 
 
 if __name__ == "__main__":

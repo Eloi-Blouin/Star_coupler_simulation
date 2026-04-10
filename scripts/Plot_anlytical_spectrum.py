@@ -23,7 +23,7 @@ def main() -> None:
 	lambda0_um = 1.55
 	theta_base = 2.0 * np.pi * c * (1.0 / lambda0_um - 1.0 / wavelength_um)
 
-	phase_offsets = [0.0, np.pi / 4.0, np.pi/2, 3*np.pi/4 ]
+	phase_offsets = [0.0, np.pi / 2, np.pi, 3*np.pi/2 ]
 	labels = ["phi = 0", "phi = π/4", "phi = π/2", "phi = 3π/4"]
 	colors = ['red', 'blue', 'green', 'orange']
 
